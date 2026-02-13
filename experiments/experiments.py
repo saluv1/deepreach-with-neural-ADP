@@ -28,6 +28,10 @@ from scipy.stats import beta as beta__dist
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import seaborn as sns
 
+import hj_reachability as hj
+import jax.numpy as jnp
+
+
 
 class Experiment(ABC):
     def __init__(self, model, dataset, experiment_dir, use_wandb):
@@ -96,56 +100,129 @@ class Experiment(ABC):
             self.model.train()
             self.model.requires_grad_(True)
             
-    def validate1(self, device, epoch, save_path, x_resolution, y_resolution, z_resolution, time_resolution):
-        was_training = self.model1.training
-        self.model1.eval()
-        self.model1.requires_grad_(False)
-
+    def validate1(self, device, epoch, save_path, x_resolution, y_resolution, z_resolution, time_resolution, time_step=None):
+        was_training = self.target_model2.training
+        self.target_model2.eval()
+        self.target_model2.requires_grad_(False)
+        v_val = 0.75  # --velocity
+        w_val = 3.0   # --omega_max
+        r_val = 0.25  # --collisionR
         plot_config = self.dataset.dynamics.plot_config()
-
+    
         state_test_range = self.dataset.dynamics.state_test_range()
         x_min, x_max = state_test_range[plot_config['x_axis_idx']]
         y_min, y_max = state_test_range[plot_config['y_axis_idx']]
         z_min, z_max = state_test_range[plot_config['z_axis_idx']]
-
-        times = torch.linspace(0, self.dataset.tMax, time_resolution)
+    
+        # ------------------------------------------------------------------
+        # 1. HJ Reachability (Ground Truth) 초기 설정
+        # ------------------------------------------------------------------
+        # Air3D Dynamics 및 Grid 설정
+        hj_dynamics = hj.systems.Air3d(
+            evader_speed=v_val, 
+            pursuer_speed=v_val, 
+            evader_max_turn_rate=w_val, 
+            pursuer_max_turn_rate=w_val
+        )
+        hj_grid = hj.Grid.from_lattice_parameters_and_boundary_conditions(
+            hj.sets.Box(np.array([-1., -1., -np.pi]), 
+                        np.array([1., 1., np.pi])),
+            (51, 40, 50), 
+            periodic_dims=2
+        )
+        # 초기 Value Function (Target Set: Cylinder r=5)
+        initial_values = jnp.linalg.norm(hj_grid.states[..., :2], axis=-1) - r_val
+        
+        # Solver 설정 (Very High Accuracy)
+        solver_settings = hj.SolverSettings.with_accuracy(
+            "very_high", hamiltonian_postprocessor=hj.solver.backwards_reachable_tube
+        )
+    
+        # ------------------------------------------------------------------
+        # 2. 시각화 루프 준비
+        # ------------------------------------------------------------------
+        times = torch.linspace(epoch * time_step, (epoch + 1) * (time_step), time_resolution)
         xs = torch.linspace(x_min, x_max, x_resolution)
         ys = torch.linspace(y_min, y_max, y_resolution)
         zs = torch.linspace(z_min, z_max, z_resolution)
         xys = torch.cartesian_prod(xs, ys)
         
-        fig = plt.figure(figsize=(5*len(times), 5*len(zs)))
+        fig = plt.figure(figsize=(5 * len(times), 5 * len(zs)))
+    
         for i in range(len(times)):
+            # [HJ Solver] 현재 시간(times[i])까지의 해 계산
+            # Backward Reachability이므로 target_time은 음수 (-t)로 설정
+            current_t_scalar = float(times[i].cpu().numpy())
+            
+            if current_t_scalar == 0:
+                hj_values = initial_values
+            else:
+                # 0초부터 -t초까지 역방향 계산
+                hj_values = hj.step(solver_settings, hj_dynamics, hj_grid, 0., initial_values, -current_t_scalar)
+    
             for j in range(len(zs)):
-                coords = torch.zeros(x_resolution*y_resolution, self.dataset.dynamics.state_dim + 1)
+                # ----------------------------------------------------------
+                # (A) Neural Network Prediction (Grid Query)
+                # ----------------------------------------------------------
+                coords = torch.zeros(x_resolution * y_resolution, self.dataset.dynamics.state_dim + 1)
                 coords[:, 0] = times[i]
                 coords[:, 1:] = torch.tensor(plot_config['state_slices'])
                 coords[:, 1 + plot_config['x_axis_idx']] = xys[:, 0]
                 coords[:, 1 + plot_config['y_axis_idx']] = xys[:, 1]
                 coords[:, 1 + plot_config['z_axis_idx']] = zs[j]
-
+    
                 with torch.no_grad():
-                    model_results = self.model1({'coords': self.dataset.dynamics.coord_to_input(coords.to(device))})
+                    model_results = self.target_model2({'coords': self.dataset.dynamics.coord_to_input(coords.to(device))})
                     values = self.dataset.dynamics.io_to_value(model_results['model_in'].detach(), model_results['model_out'].squeeze(dim=-1).detach())
                 
-                ax = fig.add_subplot(len(times), len(zs), (j+1) + i*len(zs))
-                ax.set_title('t = %0.2f, %s = %0.2f' % (times[i], plot_config['state_labels'][plot_config['z_axis_idx']], zs[j]))
-
-                raw_data = values.detach().cpu().numpy().reshape(x_resolution, y_resolution).T 
-                # s = ax.imshow(raw_data, cmap='seismic', origin='lower', extent=(-1., 1., -1., 1.))
-                s = ax.imshow(1*(values.detach().cpu().numpy().reshape(x_resolution, y_resolution).T <= 0), cmap='bwr', origin='lower', extent=(-1., 1., -1., 1.))
-                fig.colorbar(s) 
+                # Data Shaping for Plot
+                nn_grid_data = 1 * (values.detach().cpu().numpy().reshape(x_resolution, y_resolution).T <= 0)
+    
+                # ----------------------------------------------------------
+                # (B) Plotting
+                # ----------------------------------------------------------
+                ax = fig.add_subplot(len(times), len(zs), (j + 1) + i * len(zs))
+                ax.set_title('t = %0.2f, %s = %0.2f' % (times[i], plot_config['state_labels'][plot_config['z_axis_idx']], zs[j]),fontsize=14,fontweight='bold')
+    
+                # 1. Neural Net 결과 (Filled Area, 반투명)
+                # extent를 정확히 맞춰야 HJ 결과와 겹쳐짐
+                s = ax.imshow(nn_grid_data, cmap='bwr', origin='lower', 
+                              extent=(x_min, x_max, y_min, y_max), alpha=0.6)
+                
+                # 2. HJ Solver 결과 (Contour Line)
+                # 현재 z값(zs[j])과 가장 가까운 HJ Grid의 z 인덱스 찾기
+                target_z = float(zs[j].cpu().numpy())
+                # Air3D의 z축(theta)은 2번 인덱스라고 가정 (x, y, theta)
+                z_idx_hj = np.abs(hj_grid.coordinate_vectors[2] - target_z).argmin()
+                
+                # 해당 z-slice 추출 및 Transpose (.T)
+                # imshow의 x-y축과 contour의 x-y축 방향을 맞추기 위해 .T가 필요할 수 있음
+                hj_slice = hj_values[:, :, z_idx_hj].T 
+                
+                # 검은색 실선으로 0-level set 그리기
+                ax.contour(hj_grid.coordinate_vectors[0], 
+                           hj_grid.coordinate_vectors[1], 
+                           hj_slice, 
+                           levels=[0], colors='black', linewidths=2.0)
+    
+                # (옵션) 범례 추가 시 주석 해제
+                # if i == 0 and j == 0:
+                #     fig.colorbar(s, ax=ax) 
+    
+        # 저장 및 로깅
+        fig.tight_layout()
         fig.savefig(save_path)
+        
         if self.use_wandb:
             wandb.log({
                 'step': epoch,
                 'val_plot': wandb.Image(fig),
             })
         plt.close()
-
+    
         if was_training:
-            self.model1.train()
-            self.model1.requires_grad_(True)
+            self.target_model2.train()
+            self.target_model2.requires_grad_(True)
             
     
     def train(
@@ -342,444 +419,290 @@ class Experiment(ABC):
                     
 
 
-        def safe_clone(model):
-            """
-            copy.deepcopy가 실패할 때 사용하는 직렬화 방식 복제
-            (계산 그래프를 끊고 순수 파라미터만 복사함)
-            """
-            buffer = io.BytesIO()
-            torch.save(model, buffer) # 메모리에 저장
-            buffer.seek(0)
-            return torch.load(buffer,weights_only=False) # 메모리에서 불러오기 (새 객체 생성됨)
-        # ----------------------------------------------------------------------
-        # [초기화] 단일 모델 설정 (Centralized)
-        # ----------------------------------------------------------------------
-        
-        # 1. Main Model 설정
-        # self.model을 복제하지 않고 바로 사용합니다.
-        self.model.to(self.device)
-        self.model.train() 
-        for param in self.model.parameters():
-            param.requires_grad = True # 확실하게 학습 가능 상태로 설정
-
-        # 2. Target Network (학습 안정성을 위해 복제 필요)
-        # Main Model의 현재 상태를 복사해서 만듭니다.
-        self.target_model = copy.deepcopy(self.model)
-        self.target_model.eval()
-        self.target_model.to(self.device)
-        for p in self.target_model.parameters(): 
-            p.requires_grad = False
-        
-        # 3. Anchor Model (Catastrophic Forgetting 방지용, 복제 필요)
-        self.anchor_model = copy.deepcopy(self.model)
-        self.anchor_model.eval()
-        self.anchor_model.to(self.device)
-        for param in self.anchor_model.parameters():
-            param.requires_grad = False
-
-        # 4. Optimizer 정의 (Main Model에 대해서만)
-        self.optim = torch.optim.Adam(self.model.parameters(), lr=2e-5)
-        # Hyperparameters
-        alpha = 0.005
-        epochs = 2000
-        max_MPI_epochs = 10  # 한 에폭당 반복 횟수
-        total_iterations = epochs
-
-        # Boundary Condition Helper
+       # Boundary Condition Helper
         def h_func(states):
             return self.dataset.dynamics.boundary_fn(states)
 
-        # Checkpoint 경로 설정
-        checkpoints_dir = os.path.join(self.experiment_dir, 'training', 'checkpoints')
-        os.makedirs(checkpoints_dir, exist_ok=True)
-        total_steps = 0
-        train_losses = []
+        # --------------------------------------------------------------------------
+        # 1. 초기 설정
+        # --------------------------------------------------------------------------
+        refine_segments = 50
+        refine_epochs_per_segment = 200
+        VI_steps_refine = 10
+    
+        total_steps_per_segment = refine_epochs_per_segment * VI_steps_refine 
+        
+        segment_dt = self.dataset.tMax / refine_segments
+        refine_losses = []
 
-        # Anchor Weight Settings
-        initial_anchor_weight = 200.0
-        decay_rate = 0.9995
-        min_anchor_weight = 1.0
+        # Target Network 1: Temporal Neighbor (V(t-dt)) 담당 (완전 고정)
+        self.target_model1 = copy.deepcopy(self.model)
+        for param in self.target_model1.parameters():
+            param.requires_grad = False
 
-        # ==============================================================================
-        # [Main Training Loop - Centralized]
-        # ==============================================================================
-        with tqdm(total=total_iterations, desc="Training (Centralized)") as pbar:
-            for epoch in range(epochs):
-                
-                # 0. Hyperparameter Update
-                current_anchor_weight = max(
-                    min_anchor_weight, 
-                    initial_anchor_weight * (decay_rate ** epoch)
-                )
+        print("\n" + "="*80)
+        print(">>> Starting Stage 2: Backward Refinement (Sharpening the Boundary) <<<")
+        print(f"Total Segments: {refine_segments}, Steps per Segment: {total_steps_per_segment}")
+        print("="*80)
+        
+        # --------------------------------------------------------------------------
+        # 2. 세그먼트 루프 (Time-to-Go: 0 -> T 방향으로 진행)
+        # --------------------------------------------------------------------------
+        for seg_idx in range(refine_segments):
+            if seg_idx == 0:
+                continue
+            
+            t_start = ((seg_idx) * segment_dt)
+            t_end = min(self.dataset.tMax, t_start + segment_dt)
+            
+            print(f"--- Refinement Segment {seg_idx}/{refine_segments}: [{t_start:.2f}, {t_end:.2f}] ---")
 
-                # 1. Time Scheduling (Backward Curriculum)
-                progress = epoch / epochs
-                curriculum_factor = min(1.0, progress * 1.5)
-                current_t_max = self.dataset.tMax * curriculum_factor
+            # Main Model (Learner) 설정
+            self.target_model2 = copy.deepcopy(self.target_model1)
+            self.target_model2.train() 
+            for param in self.target_model2.parameters():
+                param.requires_grad = True
+            
+            self.optim_refine = torch.optim.Adam(self.target_model2.parameters(), lr=1e-5)
 
-                # 2. Update Target Network
-                # 매 에폭 시작 시 Target을 현재 모델로 갱신 (Soft update 대신 Hard update 방식 사용 중)
-                self.target_model.load_state_dict(self.model.state_dict())
-
-                # ----------------------------------------------------------------------
-                # Inner Loop (Gradient Updates)
-                # ----------------------------------------------------------------------
-                # Centralized에서는 VI_steps(교차 업데이트)가 필요 없고, 
-                # Target이 고정된 상태에서 배치 업데이트만 수행하면 됩니다
-
-                    # ------------------------------------------------------------------
-                    # 5. Bellman Target Construction (Coordinate Splitting)
-                    # V(x,t) = max(h(x), 0.5*V(t-alpha, x) + 0.5*V(t, x+f*alpha))
-                    # ------------------------------------------------------------------
-                VI_steps = 10  # ★ [복구] 한 배치에 대해 반복 학습할 횟수 (고정점 반복)
-                for pi_step in range(max_MPI_epochs):
+         
+            self.spatial_target_net = copy.deepcopy(self.target_model2)
+            self.spatial_target_net.eval()
+            for param in self.spatial_target_net.parameters():
+                param.requires_grad = False
+            loss_fn = torch.nn.HuberLoss(delta=0.1,reduction='none')
+            # ----------------------------------------------------------------------
+            # 3. 학습 루프 (Resampling Loop)
+            # ----------------------------------------------------------------------
+            with tqdm(total=total_steps_per_segment, desc=f"Refining [{t_start:.2f}~{t_end:.2f}]") as pbar:
+                for step in range(total_steps_per_segment):
                     
-                    # ------------------------------------------------------------------
-                    # 3. Sampling (배치 생성)
-                    # ------------------------------------------------------------------
-                    batch_size = 8192
+                    # (A) 매 스텝마다 데이터 새로 샘플링 
+                    batch_size = int(8192 * 4)
+                    n_steps_trajectory = 5
+                    n_uniform = int(batch_size * 0.0)
+                    n_seeds = int((batch_size - n_uniform) / (1 + n_steps_trajectory))
 
-                    n_frontier = int(batch_size * 0.3)
-                    n_uniform = batch_size - n_frontier
-                    # Main Batch: Time [0, current_t_max]
-                    t_uniform = (current_t_max) * torch.rand(n_uniform, 1, device=self.device)
-                    frontier_width = max(0.1, current_t_max * 0.1) 
-                    t_frontier = (frontier_width) * torch.rand(n_frontier, 1, device=self.device) + (current_t_max - frontier_width)
-                    rand_times = torch.cat([t_uniform, t_frontier], dim=0)
-                    rand_states = self.dataset.sample_states(batch_size).to(self.device)
-                    batch_coords = torch.cat([rand_times, rand_states], dim=-1)
+                    states_uniform = self.dataset.sample_states(n_uniform).to(self.device)
+                    temp_states = self.dataset.sample_states(int(n_seeds * 2)).to(self.device)
+                    temp_t = torch.ones((temp_states.shape[0], 1), device=self.device) * t_start
+                    temp_coords = torch.cat([temp_t, temp_states], dim=-1)
 
-                    # Anchor Batch: Time [0, tMax] (전체 영역 보존)
-                    rand_times2 = (self.dataset.tMax) * torch.rand(batch_size, 1, device=self.device)
-                    rand_states2 = self.dataset.sample_states(batch_size).to(self.device)
-                    batch_coords2 = torch.cat([rand_times2, rand_states2], dim=-1)
+                    # 시드 선별 (경계면 근처)
+                    with torch.no_grad():
+                        temp_in = self.dataset.dynamics.coord_to_input(temp_coords)
+                        # 여기선 target_model1(안정된 모델) 기준으로 샘플링
+                        temp_out = self.spatial_target_net({'coords': temp_in})['model_out']
+                        temp_val = self.dataset.dynamics.io_to_value(temp_in, temp_out.squeeze(-1))
+                        _, indices = torch.sort(torch.abs(temp_val), descending=False)
+                        seed_states = temp_states[indices[:n_seeds]]
 
-                    # ------------------------------------------------------------------
-                    # 4. Optimal Control Calculation (via Analytical Gradient)
-                    # ★ 변경 핵심: model1 vs model2 경쟁 없이, 기울기로 u*, v* 즉시 계산
-                    # ------------------------------------------------------------------
+               
+                    traj_states_list = [seed_states] 
+                    curr_stream = seed_states.clone()
                     
-                    # (1) Gradients 계산을 위해 requires_grad 켬
+                    with torch.enable_grad(): # Gradient for optimal control
+                        for _ in range(n_steps_trajectory):
+                            curr_stream.requires_grad_(True)
+                            t_input = torch.ones((curr_stream.shape[0], 1), device=self.device) * t_start
+                            stream_coords = torch.cat([t_input, curr_stream], dim=-1)
+                            u_dim = self.dataset.dynamics.control_dim
+                            v_dim = self.dataset.dynamics.disturbance_dim
+                            u_rand = torch.rand((curr_stream.shape[0], u_dim), device=self.device) * 6.0 - 3.0
+                            stream_in = self.dataset.dynamics.coord_to_input(stream_coords)
+                            # Control 계산 시에는 target_model1 사용 (안정성)
+                            stream_out = self.spatial_target_net({'coords': stream_in})['model_out']
+                            val_stream = self.dataset.dynamics.io_to_value(stream_in, stream_out.squeeze(-1))
+                            
+                            grads = torch.autograd.grad(outputs=val_stream, inputs=curr_stream,
+                                                        grad_outputs=torch.ones_like(val_stream),
+                                                        create_graph=False)[0]
+                            dv_dx_stream = grads.detach()
+                            
+                            u_opt = self.dataset.dynamics.optimal_control(curr_stream.detach(), dv_dx_stream)
+                            v_rand = torch.rand((curr_stream.shape[0], v_dim), device=self.device) * 6.0 - 3.0
+                            epsilon = 0.7
+                            mask = (torch.rand((curr_stream.shape[0], 1), device=self.device) < epsilon).float()
+                            v_opt = self.dataset.dynamics.optimal_disturbance(curr_stream.detach(), dv_dx_stream)
+                            v_mix = mask * v_rand + (1.0 - mask) * v_opt
+                            u_mix = mask * u_rand + (1.0 - mask) * u_opt
+                            ds = self.dataset.dynamics.dsdt(curr_stream.detach(), u_mix, v_opt)
+                            
+                           
+                            next_stream = curr_stream.detach() + ds * 0.08
+                            next_stream[..., 2] = (next_stream[..., 2] + math.pi) % (2 * math.pi) - math.pi
+                            traj_states_list.append(next_stream)
+                            curr_stream = next_stream
+
+                    states_trajectory = torch.cat(traj_states_list, dim=0).detach()
+                    aug_N = int(batch_size * 0.05)  # 전체 배치의 5%
+                    aug_states = self.dataset.sample_states(aug_N).to(self.device)
+
+                    sides = torch.randint(0, 2, (aug_N,), device=self.device).float() 
+                    aug_angle = (1 - sides) * (-math.pi) + sides * (math.pi)
+                    aug_states[:, 2] = (aug_angle + math.pi) % (2 * math.pi) - math.pi
+                    
+                    
+                    aug_states[:, 2] = aug_angle
+                    temp_states = torch.cat([states_uniform, states_trajectory], dim=0)
+
+                    
+                    cutoff_idx = batch_size - aug_N
+                    if temp_states.shape[0] > cutoff_idx:
+                        temp_states = temp_states[:cutoff_idx]
+                    
+                    rand_states = torch.cat([temp_states, aug_states], dim=0)
+
+                    # (혹시라도 모자랄 경우를 대비한 안전장치)
+                    if rand_states.shape[0] > batch_size:
+                        rand_states = rand_states[:batch_size]
+
+                    rand_times = torch.ones((rand_states.shape[0], 1), device=self.device) * t_start
+                    batch_coords = torch.cat([rand_times, rand_states], dim=-1).detach()
+                -------------------------------------------
                     batch_coords.requires_grad_(True)
+                    
+                    # 1. Optimal Control u, v 계산
                     model_input = self.dataset.dynamics.coord_to_input(batch_coords)
                     model_input = model_input.detach().requires_grad_(True)
-
-                    # (2) Target Model을 통해 현재 가치함수의 형상(Shape) 파악
-                    output_raw = self.target_model({'coords': model_input})['model_out']
                     
-                    # (3) Automatic Differentiation (dv/dt, dv/dx)
+                    output_raw = self.spatial_target_net({'coords': model_input})['model_out']
                     grads = self.dataset.dynamics.io_to_dv(model_input, output_raw.squeeze(-1))
-                    dv_dx = grads[..., 1:] # Spatial derivatives (Optimal Control에 필요)
-
-                    # (4) Analytical Optimal Control
-                    # Hamiltonian H(x, p) = max_v min_u [p * f(x, u, v)]
-                    # 따라서 u* = argmin, v* = argmax (Reachability 기준)
-                    batch_states = batch_coords[..., 1:]
+                    dv_dx = grads[..., 1:]
                     
-                    # 미분값(dv_dx)을 이용해 최적의 제어(u)와 방해(v)를 바로 구함
+                    batch_states = batch_coords[..., 1:]
                     with torch.no_grad():
                         u_fixed = self.dataset.dynamics.optimal_control(batch_states, dv_dx)
                         v_fixed = self.dataset.dynamics.optimal_disturbance(batch_states, dv_dx)
 
-                    # 미분 계산 끝났으므로 grad 끔 (메모리 절약)
                     batch_coords.requires_grad_(False)
 
-                    for vi_iter in range(VI_steps):
-                        
-                        # (A) Bellman Target Construction
-                        with torch.no_grad():
-                            curr_t = batch_coords[..., 0:1]
-                            curr_x = batch_coords[..., 1:]
-
-                            # --- Time Step: V(t - alpha, x) ---
-                            prev_t_time = torch.clamp(curr_t - alpha, min=self.dataset.tMin)
-                            coords_T = torch.cat([prev_t_time, curr_x], dim=-1)
-                            
-                            in_T = self.dataset.dynamics.coord_to_input(coords_T)
-                            out_T_raw = self.target_model({'coords': in_T})['model_out']
-                            val_T = self.dataset.dynamics.io_to_value(in_T, out_T_raw.squeeze(-1)).unsqueeze(-1)
-
-                            # --- Space Step: V(t, x + f(u*, v*) * alpha) ---
-                            # 위에서 고정한 u_fixed, v_fixed 사용
-                            dx = self.dataset.dynamics.dsdt(curr_x, u_fixed, v_fixed)
-                            next_x_space = curr_x + dx * alpha
-                            coords_S = torch.cat([curr_t, next_x_space], dim=-1)
-
-                            in_S = self.dataset.dynamics.coord_to_input(coords_S)
-                            out_S_raw = self.target_model({'coords': in_S})['model_out']
-                            val_S = self.dataset.dynamics.io_to_value(in_S, out_S_raw.squeeze(-1)).unsqueeze(-1)
-
-                            # --- Combine ---
-                            bellman_target = 0.5 * val_T + 0.5 * val_S
-                            bellman_target_clamped = torch.clamp(bellman_target, min=-10.0, max=10.0)
-                            
-                            boundary_val = h_func(curr_x)
-                            target_V = torch.min(boundary_val, bellman_target_clamped)
-
-                            # Anchor Target (한 번 계산하면 되지만, 구조상 루프 안에서 계산해도 무방)
-                            in_batch2 = self.dataset.dynamics.coord_to_input(batch_coords2)
-                            anchor_out_raw = self.anchor_model({'coords': in_batch2})['model_out']
-                            anchor_out_phys = self.dataset.dynamics.io_to_value(in_batch2, anchor_out_raw.squeeze(-1)).unsqueeze(-1)
-
-                        # (B) Model Update (Gradient Descent)
-                        # Main Prediction
-                        in_batch = self.dataset.dynamics.coord_to_input(batch_coords)
-                        pred_raw = self.model({'coords': in_batch})['model_out']
-                        pred_V_phys = self.dataset.dynamics.io_to_value(in_batch, pred_raw.squeeze(-1)).unsqueeze(-1)
-
-                        # Anchor Prediction
-                        pred_raw2 = self.model({'coords': in_batch2})['model_out']
-                        pred_V_phys2 = self.dataset.dynamics.io_to_value(in_batch2, pred_raw2.squeeze(-1)).unsqueeze(-1)
-
-                        # Loss Calculation
-                        loss = torch.mean((pred_V_phys - target_V) ** 2) + \
-                               current_anchor_weight * torch.mean((pred_V_phys2 - anchor_out_phys) ** 2)
-
-                        self.optim.zero_grad()
-                        loss.backward()
-                        self.optim.step()
-
-                    # Logging
-                    total_steps += 1
-                    train_losses.append(loss.item())
-                    
-                    if pi_step % 5 == 0: # Update progress bar periodically
-                        pbar.set_postfix({'Loss': f"{loss.item():.2e}", 'TargetMean': f"{target_V.mean():.2f}"})
-                        pbar.update(1)
-
-                # ----------------------------------------------------------------------
-                # 7. Checkpointing & Validation
-                # ----------------------------------------------------------------------
-                if (epoch + 1) % 10 == 0:
-                    checkpoint = {
-                        'epoch': epoch + 1,
-                        'model': self.model.state_dict(),
-                        'optimizer': self.optim.state_dict()
-                    }
-                    # 모델이 하나이므로 이름도 단순화
-                    torch.save(checkpoint, os.path.join(checkpoints_dir, 'model_epoch_%04d.pth' % (epoch + 1)))
-                    np.savetxt(os.path.join(checkpoints_dir, 'train_losses.txt'), np.array(train_losses))
-                    
-                    # Validation
-                    # self.validate1 함수가 내부적으로 self.model1을 쓴다면 self.model로 바꿔서 호출하거나
-                    # 해당 함수를 수정해야 합니다. 여기서는 self.model을 사용한다고 가정합니다.
-                    self.validate(
-                        device=self.device, epoch=epoch+1, 
-                        save_path=os.path.join(checkpoints_dir, 'BRS_validation_plot1_epoch_%04d.png' % (epoch+1)),
-                        x_resolution=val_x_resolution, y_resolution=val_y_resolution, 
-                        z_resolution=val_z_resolution, time_resolution=val_time_resolution
-                    )
-                    
-                    print(f"\n[Epoch {epoch+1}] Model Saved. Loss: {loss.item():.5f}")
-                    
-        self.model.to(self.device)
-        self.model.train() 
-        for param in self.model.parameters():
-            param.requires_grad = True # 확실하게 학습 가능 상태로 설정
-            
-        # 2. Target Network (학습 안정성을 위해 복제 필요)
-        # Main Model의 현재 상태를 복사해서 만듭니다.
-        self.target_model = copy.deepcopy(self.model)
-        self.target_model.eval()
-        self.target_model.to(self.device)
-        for p in self.target_model.parameters(): 
-            p.requires_grad = False
-            
-        # 3. Anchor Model (Catastrophic Forgetting 방지용, 복제 필요)
-        self.anchor_model = copy.deepcopy(self.model)
-        self.anchor_model.eval()
-        self.anchor_model.to(self.device)
-        for param in self.anchor_model.parameters():
-            param.requires_grad = False
-            
-        # Hyperparameters
-        alpha = 0.005
-        epochs = 2000
-        max_MPI_epochs = 10  # 한 에폭당 반복 횟수
-        total_iterations = epochs 
-
-        # Boundary Condition Helper
-        def h_func(states):
-            return self.dataset.dynamics.boundary_fn(states)
-
-        # Checkpoint 경로 설정
-        checkpoints_dir = os.path.join(self.experiment_dir, 'training', 'checkpoints')
-        os.makedirs(checkpoints_dir, exist_ok=True)
-        total_steps = 0
-        train_losses = []
-
-        # Anchor Weight Settings
-        initial_anchor_weight = 200.0
-        decay_rate = 0.9995
-        min_anchor_weight = 1.0
-
-        # ==============================================================================
-        # [Main Training Loop - Centralized]
-        # ==============================================================================
-        with tqdm(total=total_iterations, desc="Training (Centralized)") as pbar:
-            for epoch in range(epochs):
-                
-                # 0. Hyperparameter Update
-                current_anchor_weight = max(
-                    min_anchor_weight, 
-                    initial_anchor_weight * (decay_rate ** epoch)
-                )
-
-                # 1. Time Scheduling (Backward Curriculum)
-                progress = epoch / epochs
-                curriculum_factor = min(1.0, progress * 1.5)
-                current_t_max = self.dataset.tMax * curriculum_factor
-
-                # 2. Update Target Network
-                # 매 에폭 시작 시 Target을 현재 모델로 갱신 (Soft update 대신 Hard update 방식 사용 중)
-                self.target_model.load_state_dict(self.model.state_dict())
-
-                # ----------------------------------------------------------------------
-                # Inner Loop (Gradient Updates)
-                # ----------------------------------------------------------------------
-                # Centralized에서는 VI_steps(교차 업데이트)가 필요 없고, 
-                # Target이 고정된 상태에서 배치 업데이트만 수행하면 됩니다.
-                VI_steps = 10  # ★ [복구] 한 배치에 대해 반복 학습할 횟수 (고정점 반복)
-                for pi_step in range(max_MPI_epochs):
-                    
-                    # ------------------------------------------------------------------
-                    # 3. Sampling (배치 생성)
-                    # ------------------------------------------------------------------
-                    batch_size = 8192
-                    n_frontier = int(batch_size * 0.3)
-                    n_uniform = batch_size - n_frontier
-                    # Main Batch: Time [0, current_t_max]
-                    t_uniform = (current_t_max) * torch.rand(n_uniform, 1, device=self.device)
-                    frontier_width = max(0.1, current_t_max * 0.1) 
-                    t_frontier = (frontier_width) * torch.rand(n_frontier, 1, device=self.device) + (current_t_max - frontier_width)
-                    rand_times = torch.cat([t_uniform, t_frontier], dim=0)
-                    rand_states = self.dataset.sample_states(batch_size).to(self.device)
-                    batch_coords = torch.cat([rand_times, rand_states], dim=-1)
-
-                    # Anchor Batch: Time [0, tMax] (전체 영역 보존)
-                    rand_times2 = (self.dataset.tMax) * torch.rand(batch_size, 1, device=self.device)
-                    rand_states2 = self.dataset.sample_states(batch_size).to(self.device)
-                    batch_coords2 = torch.cat([rand_times2, rand_states2], dim=-1)
-
-                    # ------------------------------------------------------------------
-                    # 4. Optimal Control Calculation (via Analytical Gradient)
-                    # ★ 변경 핵심: model1 vs model2 경쟁 없이, 기울기로 u*, v* 즉시 계산
-                    # ------------------------------------------------------------------
-                    
-                    # (1) Gradients 계산을 위해 requires_grad 켬
-                    batch_coords.requires_grad_(True)
-                    model_input = self.dataset.dynamics.coord_to_input(batch_coords)
-                    model_input = model_input.detach().requires_grad_(True)
-
-                    # (2) Target Model을 통해 현재 가치함수의 형상(Shape) 파악
-                    output_raw = self.target_model({'coords': model_input})['model_out']
-                    
-                    # (3) Automatic Differentiation (dv/dt, dv/dx)
-                    grads = self.dataset.dynamics.io_to_dv(model_input, output_raw.squeeze(-1))
-                    dv_dx = grads[..., 1:] # Spatial derivatives (Optimal Control에 필요)
-
-                    # (4) Analytical Optimal Control
-                    # Hamiltonian H(x, p) = max_v min_u [p * f(x, u, v)]
-                    # 따라서 u* = argmin, v* = argmax (Reachability 기준)
-                    batch_states = batch_coords[..., 1:]
-                    
-                    # 미분값(dv_dx)을 이용해 최적의 제어(u)와 방해(v)를 바로 구함
                     with torch.no_grad():
-                        u_fixed = self.dataset.dynamics.optimal_control(batch_states, dv_dx)
-                        v_fixed = self.dataset.dynamics.optimal_disturbance(batch_states, dv_dx)
+                        curr_t = batch_coords[..., 0:1]
+                        curr_x = batch_coords[..., 1:]
 
-                    # 미분 계산 끝났으므로 grad 끔 (메모리 절약)
-                    batch_coords.requires_grad_(False)
+                        # [Temporal Target] t - dt (Time-to-Go가 줄어드는 방향 = Future/Target)
+                        # 반드시 Frozen Model (target_model1) 사용
+                        prev_t_time = torch.clamp(curr_t - segment_dt, min=self.dataset.tMin)
+                        coords_T = torch.cat([prev_t_time, curr_x], dim=-1)
+                        in_T = self.dataset.dynamics.coord_to_input(coords_T)
+                        out_T_raw = self.target_model1({'coords': in_T})['model_out']
+                        val_T = self.dataset.dynamics.io_to_value(in_T, out_T_raw.squeeze(-1)).unsqueeze(-1)
 
-                    for vi_iter in range(VI_steps):
+                
+                        dx = self.dataset.dynamics.dsdt(curr_x, u_fixed, v_fixed)
+                        next_x_space = curr_x + dx * segment_dt
+                        coords_S = torch.cat([curr_t, next_x_space], dim=-1)
+                        in_S = self.dataset.dynamics.coord_to_input(coords_S)
                         
-                        # (A) Bellman Target Construction
-                        with torch.no_grad():
-                            curr_t = batch_coords[..., 0:1]
-                            curr_x = batch_coords[..., 1:]
-
-                            # --- Time Step: V(t - alpha, x) ---
-                            prev_t_time = torch.clamp(curr_t - alpha, min=self.dataset.tMin)
-                            coords_T = torch.cat([prev_t_time, curr_x], dim=-1)
-                            
-                            in_T = self.dataset.dynamics.coord_to_input(coords_T)
-                            out_T_raw = self.target_model({'coords': in_T})['model_out']
-                            val_T = self.dataset.dynamics.io_to_value(in_T, out_T_raw.squeeze(-1)).unsqueeze(-1)
-
-                            # --- Space Step: V(t, x + f(u*, v*) * alpha) ---
-                            # 위에서 고정한 u_fixed, v_fixed 사용
-                            dx = self.dataset.dynamics.dsdt(curr_x, u_fixed, v_fixed)
-                            next_x_space = curr_x + dx * alpha
-                            coords_S = torch.cat([curr_t, next_x_space], dim=-1)
-
-                            in_S = self.dataset.dynamics.coord_to_input(coords_S)
-                            out_S_raw = self.target_model({'coords': in_S})['model_out']
-                            val_S = self.dataset.dynamics.io_to_value(in_S, out_S_raw.squeeze(-1)).unsqueeze(-1)
-
-                            # --- Combine ---
-                            bellman_target = 0.5 * val_T + 0.5 * val_S
-                            bellman_target_clamped = torch.clamp(bellman_target, min=-10.0, max=10.0)
-                            
-                            boundary_val = h_func(curr_x)
-                            target_V = torch.min(boundary_val, bellman_target_clamped)
-
-                            # Anchor Target (한 번 계산하면 되지만, 구조상 루프 안에서 계산해도 무방)
-                            in_batch2 = self.dataset.dynamics.coord_to_input(batch_coords2)
-                            anchor_out_raw = self.anchor_model({'coords': in_batch2})['model_out']
-                            anchor_out_phys = self.dataset.dynamics.io_to_value(in_batch2, anchor_out_raw.squeeze(-1)).unsqueeze(-1)
-
-                        # (B) Model Update (Gradient Descent)
-                        # Main Prediction
-                        in_batch = self.dataset.dynamics.coord_to_input(batch_coords)
-                        pred_raw = self.model({'coords': in_batch})['model_out']
-                        pred_V_phys = self.dataset.dynamics.io_to_value(in_batch, pred_raw.squeeze(-1)).unsqueeze(-1)
-
-                        # Anchor Prediction
-                        pred_raw2 = self.model({'coords': in_batch2})['model_out']
-                        pred_V_phys2 = self.dataset.dynamics.io_to_value(in_batch2, pred_raw2.squeeze(-1)).unsqueeze(-1)
-
-                        # Loss Calculation
-                        loss = torch.mean((pred_V_phys - target_V) ** 2) + \
-                               current_anchor_weight * torch.mean((pred_V_phys2 - anchor_out_phys) ** 2)
-
-                        self.optim.zero_grad()
-                        loss.backward()
-                        self.optim.step()
-
-                    # Logging
-                    total_steps += 1
-                    train_losses.append(loss.item())
                     
-                    if pi_step % 5 == 0: # Update progress bar periodically
-                        pbar.set_postfix({'Loss': f"{loss.item():.2e}", 'TargetMean': f"{target_V.mean():.2f}"})
-                        pbar.update(1)
+                        out_S_raw = self.spatial_target_net({'coords': in_S})['model_out']
+                        val_S = self.dataset.dynamics.io_to_value(in_S, out_S_raw.squeeze(-1)).unsqueeze(-1)
 
-                # ----------------------------------------------------------------------
-                # 7. Checkpointing & Validation
-                # ----------------------------------------------------------------------
-                if (epoch + 1) % 10 == 0:
-                    checkpoint = {
-                        'epoch': epoch + 1,
-                        'model': self.model.state_dict(),
-                        'optimizer': self.optim.state_dict()
-                    }
-                    # 모델이 하나이므로 이름도 단순화
-                    torch.save(checkpoint, os.path.join(checkpoints_dir, 'model_epoch_%04d.pth' % (epoch + 1)))
-                    np.savetxt(os.path.join(checkpoints_dir, 'train_losses.txt'), np.array(train_losses))
+                        # Mixing Logic (Alpha)
+                        diff = torch.abs(val_S.detach() - val_T)
+                        alpha = torch.tanh(diff * 10.0)
+                        mixed_target = 0.5 * val_S.detach() + 0.5 * val_T
+                        bellman_target = mixed_target # 필요시 alpha 적용: alpha * mixed + (1-alpha) * val_S
+                        
+                        # Boundary Condition (Min-Max)
+                        h_val = h_func(curr_x).view(-1, 1)
+                        correction_bias = 0.005
+                        target_V = torch.min(h_val, bellman_target).detach()
+
+                    # --------------------------------------------------------------
+                    # (C) Loss & Update
+                    # --------------------------------------------------------------
+                    in_batch = self.dataset.dynamics.coord_to_input(batch_coords)
+                    pred_raw = self.target_model2({'coords': in_batch})['model_out']
+                    pred_V_phys = self.dataset.dynamics.io_to_value(in_batch, pred_raw.squeeze(-1)).unsqueeze(-1)
+                    with torch.no_grad():
+                        old_raw = self.spatial_target_net({'coords': in_batch})['model_out']
+                        pred_V_old = self.dataset.dynamics.io_to_value(in_batch, old_raw.squeeze(-1)).unsqueeze(-1)
+                    ppo_eps = 0.1
+                    pred_V_clipped = pred_V_old + torch.clamp(pred_V_phys - pred_V_old, -ppo_eps, ppo_eps)
+                    loss1=loss_fn(pred_V_clipped, target_V)
+                    loss2=loss_fn(pred_V_phys,target_V)
+                    loss=loss2
+                    grad_norm = torch.norm(dv_dx, p=2, dim=-1)
+                    min_slope = 0.001
+                    slope_ratio = torch.clamp(grad_norm / min_slope, max=1.0)
                     
-                    # Validation
-                    # self.validate1 함수가 내부적으로 self.model1을 쓴다면 self.model로 바꿔서 호출하거나
-                    # 해당 함수를 수정해야 합니다. 여기서는 self.model을 사용한다고 가정합니다.
-                    self.validate(
-                        device=self.device, epoch=epoch+1, 
-                        save_path=os.path.join(checkpoints_dir, 'BRS_validation_plot2_epoch_%04d.png' % (epoch+1)),
-                        x_resolution=val_x_resolution, y_resolution=val_y_resolution, 
-                        z_resolution=val_z_resolution, time_resolution=val_time_resolution
-                    )
+                    loss_barrier = torch.relu(min_slope-grad_norm)
+                    # Boundary Pixel Weighting
+                    band_width = 0.02
+                    is_boundary = (torch.abs(target_V) < band_width).float()
+                    pixel_weights = 1.0 + 1.0 * is_boundary # 필요 시 사용, 지금은 MSE 단순화
+                    mask_narrow_band = (torch.abs(target_V) < band_width).float()
+                    num_boundary_pixels = torch.sum(mask_narrow_band)
+                    if num_boundary_pixels > 0:
+                        loss_slope = torch.sum(loss_barrier * mask_narrow_band) / num_boundary_pixels
+                    else:
+                        loss_slope = torch.tensor(0.0, device=self.device)
+                    MSE = (pred_V_phys - target_V) ** 2
+                    k_lse = 50.0 
+                    errors = torch.abs(pred_V_phys - target_V)
+                    lse_loss = torch.logsumexp(k_lse * errors, dim=0) / k_lse
+                    # loss = torch.mean(loss)+1.0*loss_slope 
+                    loss=lse_loss+loss_slope
+                    self.optim_refine.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.target_model2.parameters(), max_norm=1.0)
+                    self.optim_refine.step()
+
+                    # --------------------------------------------------------------
+                    # (D) Soft Update
+                    # --------------------------------------------------------------
+                    # with torch.no_grad():
+                    #     tau = 0.005 # 매 스텝 0.5%씩 반영 (Resampling 하므로 충분함)
+                    #     for target_param, main_param in zip(self.spatial_target_net.parameters(), self.target_model2.parameters()):
+                    #         target_param.data.copy_(
+                    #             (1.0 - tau) * target_param.data + tau * main_param.data
+                    #         )
+                    target_update_freq = 100
+                    if step % target_update_freq == 0:
+                        self.spatial_target_net.load_state_dict(self.target_model2.state_dict())
+                    refine_losses.append(loss.item())
                     
-                    print(f"\n[Epoch {epoch+1}] Model Saved. Loss: {loss.item():.5f}")
-                    
-        print("Training Finished (Centralized).")
+                    if step % 100 == 0:
+                        pbar.set_postfix({'Loss': f"{loss.item():.2e}"})
+                        pbar.update(100)
+
+            # ----------------------------------------------------------------------
+            # 4. 세그먼트 종료 후 처리
+            # ----------------------------------------------------------------------
+            checkpoint = {
+                'segment_idx': seg_idx,
+                'time_range': (t_start, t_end),
+                'model': self.target_model2.state_dict(),
+                'optimizer': self.optim_refine.state_dict()
+            }
+            save_name = f'refine_seg_{seg_idx:02d}_T_{t_start:.2f}.pth'
+            torch.save(checkpoint, os.path.join(checkpoints_dir, save_name))
+            np.savetxt(os.path.join(checkpoints_dir, 'refine_losses.txt'), np.array(refine_losses))
+
+            # Validation Plot
+            plot_name = f'Refine_Plot_Seg_{seg_idx:02d}_T_{t_start:.2f}.png'
+            self.validate1(
+                device=self.device, 
+                epoch=seg_idx,
+                save_path=os.path.join(checkpoints_dir, plot_name),
+                x_resolution=val_x_resolution, y_resolution=val_y_resolution, 
+                z_resolution=val_z_resolution, time_resolution=val_time_resolution,
+                time_step=segment_dt
+            )
+            
+            print(f"[Segment {seg_idx}] Saved: {save_name} | Plot: {plot_name} | Final Loss: {loss.item():.5f}")
+            
+            # 다음 세그먼트(Time-to-Go가 더 큰 시간)를 위해 현재 모델을 Freeze하여 target_model1으로 승격
+            self.target_model1 = copy.deepcopy(self.target_model2)
+            for param in self.target_model1.parameters():
+                param.requires_grad = False
+
+        print("\n" + "="*80)
+        print("Pure Backward Refinement Finished Successfully.")
+        print("="*80)      
+        
         with tqdm(total=len(train_dataloader) * epochs) as pbar:
 
             last_CSL_epoch = -1
