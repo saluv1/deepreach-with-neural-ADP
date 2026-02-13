@@ -211,15 +211,113 @@ class Air3D(Dynamics):
         self.angle_alpha_factor = angle_alpha_factor
         super().__init__(
             loss_type='brt_hjivi', set_mode='avoid',
-            state_dim=3, input_dim=4, control_dim=1, disturbance_dim=1,
+            state_dim=3, input_dim=5, control_dim=1, disturbance_dim=1,
             state_mean=[0, 0, 0], 
-            state_var=[1, 1, self.angle_alpha_factor*math.pi],
+            state_var=[1, 1, self.angle_alpha_factor * math.pi],
             value_mean=0.25, 
             value_var=0.5, 
             value_normto=0.02,
             deepreach_model="exact",
         )
+        
+    def coord_to_input(self, coord):
+        # coord shape: [..., 4] -> (t, x, y, theta)
+        
+        # 1. 시간, x,y, theta 분리
+        time_part = coord[..., 0:1]
+        xy_part = coord[..., 1:3]     # x, y (2개)
+        theta_part = coord[..., 3:4]  # theta (1개)
 
+        # 2. (x, y)만 정규화 (mean/var의 앞쪽 2개만 사용)
+        # device 문제 방지를 위해 .to(coord.device) 사용
+        mean_xy = self.state_mean[:2].to(coord.device) 
+        var_xy = self.state_var[:2].to(coord.device)
+        
+        normalized_xy = (xy_part - mean_xy) / var_xy
+        
+        # 3. theta는 정규화 대신 cos, sin 변환
+        cos_sin_part = torch.cat([torch.cos(theta_part), torch.sin(theta_part)], dim=-1)
+
+        # 4. (t, norm_x, norm_y, cos, sin) 합치기
+        return torch.cat([time_part, normalized_xy, cos_sin_part], dim=-1)
+
+    def input_to_coord(self, input):
+        # input shape: [..., 5] -> (t, x_norm, y_norm, cos, sin)
+        
+        # 1. 분리
+        time_part = input[..., 0:1]
+        xy_norm_part = input[..., 1:3]      # 정규화된 x, y
+        cos_sin_part = input[..., 3:5]      # cos, sin
+
+        # 2. (x, y) 역-정규화 (복원)
+        mean_xy = self.state_mean[:2].to(input.device)
+        var_xy = self.state_var[:2].to(input.device)
+        
+        restored_xy = (xy_norm_part * var_xy) + mean_xy
+
+        # 3. cos, sin -> theta 복원 (atan2 사용)
+        # input[..., 4]는 sin, input[..., 3]는 cos
+        # atan2(y, x) 순서이므로 atan2(sin, cos)
+        restored_theta = torch.atan2(input[..., 4:5], input[..., 3:4])
+
+        # 4. (t, x, y, theta) 합치기
+        return torch.cat([time_part, restored_xy, restored_theta], dim=-1)
+        
+    def io_to_dv(self, input, output):
+        # input: [t, x_norm, y_norm, cos, sin]
+        # output: Value
+        
+        # 1. 전체 Jacobian 계산 (d Output / d Input)
+        # dodi shape: [..., 5] (t, x, y, cos, sin 순서)
+        dodi = diff_operators.jacobian(output.unsqueeze(dim=-1), input)[0].squeeze(dim=-2)
+
+        # 2. 공통 스케일링 팩터 계산
+        # (exact 모델인 경우 시간 t(input[..., 0])를 곱해줘야 함)
+        if self.deepreach_model == "exact":
+            scale = (self.value_var / self.value_normto) * input[..., 0].unsqueeze(-1)
+            # dvdt 계산 (시간 미분 + 원래 값)
+            dvdt = (self.value_var / self.value_normto) * (input[..., 0] * dodi[..., 0] + output)
+        else: # diff or others
+            scale = (self.value_var / self.value_normto)
+            dvdt = scale * dodi[..., 0]
+
+        # =========================================================
+        # [핵심 수정] 3. Chain Rule 적용하여 (x, y, theta) 미분 구하기
+        # =========================================================
+        
+        # (1) x, y 파트: 정규화된 것을 복원 (/ state_var)
+        # dodi[..., 1:3] -> x, y에 대한 미분값
+        # self.state_var[:2] -> x, y의 분산
+        dvds_xy = (scale / self.state_var[:2].to(dodi.device)) * dodi[..., 1:3]
+
+        # (2) theta 파트: cos, sin 미분을 theta 미분으로 변환
+        # d V / d theta = (d V / d cos) * (-sin) + (d V / d sin) * (cos)
+        d_cos = dodi[..., 3:4] # cos에 대한 미분값
+        d_sin = dodi[..., 4:5] # sin에 대한 미분값
+        
+        cos_theta = input[..., 3:4]
+        sin_theta = input[..., 4:5]
+
+        # Chain rule 적용 (theta는 정규화 안 했으므로 state_var 안 나눔)
+        dvds_theta = scale * (d_cos * (-sin_theta) + d_sin * (cos_theta))
+
+        # (3) 합치기 (term1)
+        dvds_term1 = torch.cat([dvds_xy, dvds_theta], dim=-1)
+
+        # =========================================================
+
+        # 4. Boundary Condition 미분항 (term2)
+        # 상태를 물리 좌표로 복원
+        state = self.input_to_coord(input)[..., 1:] 
+        
+        # Boundary 함수 미분
+        dvds_term2 = diff_operators.jacobian(self.boundary_fn(state).unsqueeze(dim=-1), state)[0].squeeze(dim=-2)
+        
+        # 5. 최종 합산
+        dvds = dvds_term1 + dvds_term2
+
+        return torch.cat((dvdsdt.unsqueeze(dim=-1) if 'dvdsdt' in locals() else dvdt.unsqueeze(dim=-1), dvds), dim=-1)
+        
     def state_test_range(self):
         return [
             [-1, 1],
