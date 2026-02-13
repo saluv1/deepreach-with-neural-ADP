@@ -53,6 +53,7 @@ pip3 install torch torchvision torchaudio --index-url https://download.pytorch.o
 ```
 python run_experiment.py --mode train --experiment_class DeepReach --dynamics_class Dubins3D --experiment_name dubins3d_tutorial_run --minWith target --goalR 0.25 --velocity 0.6 --omega_max 1.1 --angle_alpha_factor 1.2 --set_mode avoid
 ```
+`run_experiment.py` implements a standard DeepReach experiment. For example, to learn the value function for the avoid Air3D system with parameters `collisionR=0.25`, `velocity=0.75`, `omega_max=3.0`, run:
 ```
 python run_experiment.py --mode train --experiment_class DeepReach --dynamics_class Air3D --experiment_name dubins3d_tutorial_run --minWith target --collisionR 0.25 --velocity 0.75 --omega_max 3 --angle_alpha_factor 1.2
 ```
