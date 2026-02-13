@@ -47,7 +47,10 @@ Install the appropriate PyTorch package for your system. For example, for a Wind
 ```
 pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 ```
-
+If you only want CPU computation or have already installed JAX with your preferred accelerator support, you may install this package using pip:
+```
+pip install --upgrade hj-reachability
+```
 ## Running a DeepReach Experiment
 `run_experiment.py` implements a standard DeepReach experiment. For example, to learn the value function for the avoid Dubins3D system with parameters `goalR=0.25`, `velocity=0.6`, `omega_max=1.1`, run:
 ```
