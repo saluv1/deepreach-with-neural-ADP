@@ -287,7 +287,7 @@ class Dubins6D(Dynamics):
             loss_type='brt_hjivi', set_mode=set_mode,
             state_dim=6, input_dim=7, control_dim=1, disturbance_dim=1,
             state_mean=[0, 0, 0, 0, 0, 0], 
-            state_var=[1, 1, self.angle_alpha_factor*math.pi, 1, 1, self.angle_alpha_factor*math.pi],
+            state_var=[1.5, 1.5, self.angle_alpha_factor*math.pi, 1.5, 1.5, self.angle_alpha_factor*math.pi],
             value_mean=0.25, 
             value_var=0.5, 
             value_normto=0.02,
@@ -295,11 +295,11 @@ class Dubins6D(Dynamics):
         )
     def state_test_range(self):
         return [
-            [-1, 1],
-            [-1, 1],
+            [-1.5, 1.5],
+            [-1.5, 1.5],
             [-math.pi, math.pi],
-            [-1, 1],
-            [-1, 1],
+            [-1.5, 1.5],
+            [-1.5, 1.5],
             [-math.pi, math.pi],
         ]
     def equivalent_wrapped_state(self, state):
