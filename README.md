@@ -60,7 +60,10 @@ python run_experiment.py --mode train --experiment_class DeepReach --dynamics_cl
 ```
 python run_experiment.py --mode train --experiment_class DeepReach --dynamics_class Air3D --experiment_name dubins3d_tutorial_run --minWith target --collisionR 0.25 --velocity 0.75 --omega_max 3 --angle_alpha_factor 1.2
 ```
-
+`run_experiment.py` implements a standard DeepReach experiment. For example, to learn the value function for the avoid dubins6D system with parameters `collisionR=0.32`, `v=0.6`, `omega_max=1.9`, run:
+```
+python run_experiment.py --mode train --experiment_class DeepReach --dynamics_class Dubins6D --experiment_name dubins6d_tutorial_run --minWith target --collisionR 0.32 --vp 0.6 --ve 0.6 --ue_max 1.9 --up_max 1.9 --angle_alpha_factor 1.2
+```
 Note that the script provides many common training arguments, like `num_epochs` and the option to `pretrain`. Up-to-date, documentation for these different training schemes is lacking; feel free to reach out to the lab for questions. `use_CSL` is an experimental training option (similar in spirit to actor-critic methods) being developed by SIA for improved value function learning. 
 
 ## Monitoring a DeepReach Experiment
