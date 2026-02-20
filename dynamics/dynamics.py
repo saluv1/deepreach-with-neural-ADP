@@ -145,20 +145,17 @@ class ParameterizedVertDrone2D(Dynamics):
         self.control_range_ =torch.tensor([[-self.input_magnitude_max, self.input_magnitude_max]]).cuda()
         self.eps_var=torch.tensor([2]).cuda()
         self.control_init= torch.ones(1).cuda()*gravity/input_multiplier 
-
-
         state_mean_=(self.state_range_[:,0]+self.state_range_[:,1])/2.0
         state_var_=(self.state_range_[:,1]-self.state_range_[:,0])/2.0
-
         super().__init__(
-            name='ParameterizedVertDrone2D', loss_type='brt_hjivi', set_mode='avoid',
+            loss_type='brt_hjivi', set_mode='avoid',
             state_dim=3, input_dim=4, control_dim=1, disturbance_dim=0,
             state_mean=state_mean_.cpu().tolist(),
             state_var=state_var_.cpu().tolist(),    
             value_mean=0.5,
             value_var=1,
             value_normto=0.02,
-            deepReach_model='exact',  # chioce ['vanilla', 'exact'],
+            deepreach_model='exact',  # chioce ['vanilla', 'exact'],
         )
 
     def control_range(self, state):
