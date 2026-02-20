@@ -477,8 +477,6 @@ class Experiment(ABC):
 
                     
 
-
-       # Boundary Condition Helper
         def h_func(states):
             return self.dataset.dynamics.boundary_fn(states)
 
@@ -538,27 +536,24 @@ class Experiment(ABC):
             with tqdm(total=total_steps_per_segment, desc=f"Refining [{t_start:.2f}~{t_end:.2f}]") as pbar:
                 for step in range(total_steps_per_segment):
                     
-                    # (A) 매 스텝마다 데이터 새로 샘플링 (발산 방지 핵심!)
-                    batch_size = int(8192 * 4)
+                    batch_size = int(8192 * 8)
                     n_steps_trajectory = 5
                     n_uniform = int(batch_size * 0.4)
                     n_seeds = int((batch_size - n_uniform) / (1 + n_steps_trajectory))
 
                     states_uniform = self.dataset.sample_states(n_uniform).to(self.device)
-                    temp_states = self.dataset.sample_states(int(n_seeds * 2)).to(self.device)
+                    temp_states = self.dataset.sample_states(int(n_seeds * 4)).to(self.device)
                     temp_t = torch.ones((temp_states.shape[0], 1), device=self.device) * t_start
                     temp_coords = torch.cat([temp_t, temp_states], dim=-1)
 
                     # 시드 선별 (경계면 근처)
                     with torch.no_grad():
                         temp_in = self.dataset.dynamics.coord_to_input(temp_coords)
-                        # 여기선 target_model1(안정된 모델) 기준으로 샘플링
                         temp_out = self.spatial_target_net({'coords': temp_in})['model_out']
                         temp_val = self.dataset.dynamics.io_to_value(temp_in, temp_out.squeeze(-1))
                         _, indices = torch.sort(torch.abs(temp_val), descending=False)
                         seed_states = temp_states[indices[:n_seeds]]
 
-                    # Trajectory 생성
                     traj_states_list = [seed_states] 
                     curr_stream = seed_states.clone()
                     
@@ -569,7 +564,7 @@ class Experiment(ABC):
                             stream_coords = torch.cat([t_input, curr_stream], dim=-1)
                             u_dim = self.dataset.dynamics.control_dim
                             v_dim = self.dataset.dynamics.disturbance_dim
-                            u_rand = torch.rand((curr_stream.shape[0], u_dim), device=self.device) * 6.0 - 3.0
+                            u_rand = torch.rand((curr_stream.shape[0], u_dim), device=self.device) * 3.8 - 1.9
                             stream_in = self.dataset.dynamics.coord_to_input(stream_coords)
                             # Control 계산 시에는 target_model1 사용 (안정성)
                             stream_out = self.spatial_target_net({'coords': stream_in})['model_out']
@@ -581,7 +576,7 @@ class Experiment(ABC):
                             dv_dx_stream = grads.detach()
                             
                             u_opt = self.dataset.dynamics.optimal_control(curr_stream.detach(), dv_dx_stream)
-                            v_rand = torch.rand((curr_stream.shape[0], v_dim), device=self.device) * 6.0 - 3.0
+                            v_rand = torch.rand((curr_stream.shape[0], v_dim), device=self.device) * 3.8 - 1.9
                             epsilon = 0.5
                             mask = (torch.rand((curr_stream.shape[0], 1), device=self.device) < epsilon).float()
                             v_opt = self.dataset.dynamics.optimal_disturbance(curr_stream.detach(), dv_dx_stream)
@@ -589,28 +584,23 @@ class Experiment(ABC):
                             u_mix = mask * u_rand + (1.0 - mask) * u_opt
                             sim_dt = 0.08
                             k1 = self.dataset.dynamics.dsdt(curr_stream.detach(), u_mix, v_opt)
-                        
-                            # k2: 중간점 1 (0.5 dt 이동)
+                            
                             x_k2 = curr_stream.detach() + 0.5 * sim_dt * k1
                             x_k2[..., 2] = (x_k2[..., 2] + math.pi) % (2 * math.pi) - math.pi # 각도 정규화
                             k2 = self.dataset.dynamics.dsdt(x_k2, u_mix, v_opt)
                         
-                            # k3: 중간점 2 (0.5 dt 이동, k2 기울기 사용)
+                            
                             x_k3 = curr_stream.detach() + 0.5 * sim_dt * k2
                             x_k3[..., 2] = (x_k3[..., 2] + math.pi) % (2 * math.pi) - math.pi
                             k3 = self.dataset.dynamics.dsdt(x_k3, u_mix, v_opt)
                         
-                            # k4: 끝점 (dt 이동, k3 기울기 사용)
                             x_k4 = curr_stream.detach() + sim_dt * k3
                             x_k4[..., 2] = (x_k4[..., 2] + math.pi) % (2 * math.pi) - math.pi
                             k4 = self.dataset.dynamics.dsdt(x_k4, u_mix, v_opt)
                         
-                            # 최종 RK4 업데이트 (가중 평균)
-                            # 오차 O(dt^5)로 줄어들어 원 궤도를 정확히 따라감
                             dx_rk4 = (sim_dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
                             next_x_space = curr_stream.detach() + dx_rk4
                         
-                            # 최종 위치 각도 정규화
                             next_x_space[..., 2] = (next_x_space[..., 2] + math.pi) % (2 * math.pi) - math.pi
                             # ds = self.dataset.dynamics.dsdt(curr_stream.detach(), u_mix, v_opt)
                             
@@ -621,27 +611,27 @@ class Experiment(ABC):
                             curr_stream = next_x_space
 
                     states_trajectory = torch.cat(traj_states_list, dim=0).detach()
-                    aug_N = int(batch_size * 0.01)  # 전체 배치의 5%
-                    aug_states = self.dataset.sample_states(aug_N).to(self.device)
+                    # aug_N = int(batch_size * 0.00)  # 전체 배치의 5%
+                    # aug_states = self.dataset.sample_states(aug_N).to(self.device)
 
-                    sides = torch.randint(0, 2, (aug_N,), device=self.device).float() 
-                    aug_angle = (1 - sides) * (-math.pi) + sides * (math.pi)
-                    aug_states[:, 2] = (aug_angle + math.pi) % (2 * math.pi) - math.pi
+                    # sides = torch.randint(0, 2, (aug_N,), device=self.device).float() 
+                    # aug_angle = (1 - sides) * (-math.pi) + sides * (math.pi)
+                    # aug_states[:, 2] = (aug_angle + math.pi) % (2 * math.pi) - math.pi
                     
-                    # 상태 벡터의 각도 차원(index 2)에 덮어쓰기
-                    aug_states[:, 2] = aug_angle
-                    temp_states = torch.cat([states_uniform, states_trajectory], dim=0)
+                    # # 상태 벡터의 각도 차원(index 2)에 덮어쓰기
+                    # aug_states[:, 2] = aug_angle
+                    rand_states = torch.cat([states_uniform, states_trajectory], dim=0)
 
                     
-                    cutoff_idx = batch_size - aug_N
-                    if temp_states.shape[0] > cutoff_idx:
-                        temp_states = temp_states[:cutoff_idx]
+                    # cutoff_idx = batch_size - aug_N
+                    # if temp_states.shape[0] > cutoff_idx:
+                    #     temp_states = temp_states[:cutoff_idx]
                     
-                    rand_states = torch.cat([temp_states, aug_states], dim=0)
+                    # rand_states = torch.cat([temp_states, aug_states], dim=0)
 
-                    # (혹시라도 모자랄 경우를 대비한 안전장치)
-                    if rand_states.shape[0] > batch_size:
-                        rand_states = rand_states[:batch_size]
+                    # # (혹시라도 모자랄 경우를 대비한 안전장치)
+                    # if rand_states.shape[0] > batch_size:
+                    #     rand_states = rand_states[:batch_size]
 
                     rand_times = torch.ones((rand_states.shape[0], 1), device=self.device) * t_start
                     batch_coords = torch.cat([rand_times, rand_states], dim=-1).detach()
@@ -655,7 +645,6 @@ class Experiment(ABC):
                     model_input = self.dataset.dynamics.coord_to_input(batch_coords)
                     model_input = model_input.detach().requires_grad_(True)
                     
-                    # Control을 구할 때는 현재 학습중인 모델(target_model2)의 Gradient를 참조해도 됨 (혹은 spatial_target_net)
                     output_raw = self.spatial_target_net({'coords': model_input})['model_out']
                     grads = self.dataset.dynamics.io_to_dv(model_input, output_raw.squeeze(-1))
                     dv_dx = grads[..., 1:]
@@ -683,32 +672,25 @@ class Experiment(ABC):
                         # 반드시 Spatial Snapshot (spatial_target_net) 사용
                         k1 = self.dataset.dynamics.dsdt(curr_x, u_fixed, v_fixed)
                         
-                        # k2: 중간점 1 (0.5 dt 이동)
                         x_k2 = curr_x + 0.5 * segment_dt * k1
                         x_k2[..., 2] = (x_k2[..., 2] + math.pi) % (2 * math.pi) - math.pi # 각도 정규화
                         k2 = self.dataset.dynamics.dsdt(x_k2, u_fixed, v_fixed)
                         
-                        # k3: 중간점 2 (0.5 dt 이동, k2 기울기 사용)
                         x_k3 = curr_x + 0.5 * segment_dt * k2
                         x_k3[..., 2] = (x_k3[..., 2] + math.pi) % (2 * math.pi) - math.pi
                         k3 = self.dataset.dynamics.dsdt(x_k3, u_fixed, v_fixed)
                         
-                        # k4: 끝점 (dt 이동, k3 기울기 사용)
                         x_k4 = curr_x + segment_dt * k3
                         x_k4[..., 2] = (x_k4[..., 2] + math.pi) % (2 * math.pi) - math.pi
                         k4 = self.dataset.dynamics.dsdt(x_k4, u_fixed, v_fixed)
                         
-                        # 최종 RK4 업데이트 (가중 평균)
-                        # 오차 O(dt^5)로 줄어들어 원 궤도를 정확히 따라감
                         dx_rk4 = (segment_dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
                         next_x_space = curr_x + dx_rk4
                         
-                        # 최종 위치 각도 정규화
                         next_x_space[..., 2] = (next_x_space[..., 2] + math.pi) % (2 * math.pi) - math.pi
                         coords_S = torch.cat([curr_t, next_x_space], dim=-1)
                         in_S = self.dataset.dynamics.coord_to_input(coords_S)
                         
-                        # [핵심 변경] target_model2 대신 spatial_target_net 사용
                         out_S_raw = self.spatial_target_net({'coords': in_S})['model_out']
                         val_S = self.dataset.dynamics.io_to_value(in_S, out_S_raw.squeeze(-1)).unsqueeze(-1)
 
@@ -824,6 +806,12 @@ class Experiment(ABC):
             for param in self.target_model1.parameters():
                 param.requires_grad = False
 
+        self.model=copy.deepcopy(self.target_model1)
+
+        final_path = os.path.join(checkpoints_dir, 'model_final.pth')
+        torch.save({'model': self.model.state_dict()}, final_path)
+        print(f"Final Refined Model saved to: {final_path}")
+        
         print("\n" + "="*80)
         print("Pure Backward Refinement Finished Successfully.")
         print("="*80)      
@@ -1084,13 +1072,15 @@ class Experiment(ABC):
 
     def _load_checkpoint(self, epoch):
         if epoch == -1:
-            model_path = os.path.join(self.experiment_dir, 'training', 'checkpoints', 'model_final.pth')
-            self.model.load_state_dict(torch.load(model_path))
+            model_path = os.path.join(
+                self.experiment_dir, 'training', 'checkpoints', 'model_final.pth')
+            self.model.load_state_dict(torch.load(model_path)['model'])
         else:
-            model_path = os.path.join(self.experiment_dir, 'training', 'checkpoints', 'model_epoch_%d.pth' % epoch)
-            self.model.load_state_dict(torch.load(model_path))
+            model_path = os.path.join(
+                self.experiment_dir, 'training', 'checkpoints', 'model_epoch_%04d.pth' % epoch)
+            self.model.load_state_dict(torch.load(model_path)['model'])
 
-    def test(self, device, current_time, last_checkpoint, checkpoint_dt, dt, num_scenarios, num_violations, set_type, control_type, data_step, checkpoint_toload=None,
+    def test(self, current_time, last_checkpoint, checkpoint_dt, dt, num_scenarios, num_violations, set_type, control_type, data_step, checkpoint_toload=None,
              gt_data_path=None):
         was_training = self.model.training
         self.model.eval()
@@ -1138,15 +1128,14 @@ class Experiment(ABC):
                 for j in tqdm(range(sidelen), desc='Simulation Time', leave=False):
                     # get BRT volume, error, error rate, error region fraction
                     results = scenario_optimization(
-                        device=device, model=self.model,policy=self.model,dynamics=self.dataset.dynamics, tMin=self.dataset.tMin, tMax=times[
+                        model=self.model, dynamics=self.dataset.dynamics, tMin=self.dataset.tMin, t=times[
                             j], dt=dt,
                         set_type=set_type, control_type=control_type,
                         scenario_batch_size=min(num_scenarios, 100000), sample_batch_size=min(10*num_scenarios, 1000000),
-                        sample_generator=SliceSampleGenerator(dynamics=self.dataset.dynamics, slices=[None]*self.dataset.dynamics.state_dim),
                         sample_validator=ValueThresholdValidator(
-                            v_min=0.0, v_max=float('inf')),
-                        violation_validator=ValueThresholdValidator(
                             v_min=float('-inf'), v_max=0.0),
+                        violation_validator=ValueThresholdValidator(
+                            v_min=0.0, v_max=float('inf')),
                         max_scenarios=num_scenarios, max_samples=1000*num_scenarios)
                     BRT_volumes_matrix[i, j] = results['valid_sample_fraction']
                     if results['maxed_scenarios']:
@@ -1154,7 +1143,7 @@ class Experiment(ABC):
                                           j] = results['max_violation_error']
                         BRT_error_rates_matrix[i,
                                                j] = results['violation_rate']
-                        BRT_error_region_fracs_matrix[i, j] = target_fraction(device=device,
+                        BRT_error_region_fracs_matrix[i, j] = target_fraction(
                             model=self.model, dynamics=self.dataset.dynamics, t=times[j],
                             sample_validator=ValueThresholdValidator(
                                 v_min=float('-inf'), v_max=0.0),
@@ -1168,11 +1157,10 @@ class Experiment(ABC):
 
                     # get exBRT error, error rate, error region fraction
                     results = scenario_optimization(
-                        device=device, model=self.model,policy=self.model,dynamics=self.dataset.dynamics, tMin=self.dataset.tMin, tMax=times[
+                        model=self.model, dynamics=self.dataset.dynamics, tMin=self.dataset.tMin, t=times[
                             j], dt=dt,
                         set_type=set_type, control_type=control_type,
                         scenario_batch_size=min(num_scenarios, 100000), sample_batch_size=min(10*num_scenarios, 1000000),
-                        sample_generator=SliceSampleGenerator(dynamics=self.dataset.dynamics, slices=[None]*self.dataset.dynamics.state_dim),
                         sample_validator=ValueThresholdValidator(
                             v_min=0.0, v_max=float('inf')),
                         violation_validator=ValueThresholdValidator(
@@ -1186,7 +1174,7 @@ class Experiment(ABC):
                         exBRT_error_rates_matrix[i,
                                                  j] = results['violation_rate']
                         exBRT_error_region_fracs_matrix[i, j] = target_fraction(
-                            device=device,model=self.model, dynamics=self.dataset.dynamics, t=times[j],
+                            model=self.model, dynamics=self.dataset.dynamics, t=times[j],
                             sample_validator=ValueThresholdValidator(
                                 v_min=0.0, v_max=float('inf')),
                             target_validator=ValueThresholdValidator(
@@ -1288,8 +1276,8 @@ class Experiment(ABC):
 
             
             if data_step == "eval_w_gt":
-                coords=torch.load(os.path.join(gt_data_path,"coords.pt")).to(device)
-                gt_values=torch.load(os.path.join(gt_data_path,"gt_values.pt")).to(device)
+                coords=torch.load(os.path.join(gt_data_path,"coords.pt")).cuda()
+                gt_values=torch.load(os.path.join(gt_data_path,"gt_values.pt")).cuda()
                 with torch.no_grad():
                     results = model(
                         {'coords': self.dataset.dynamics.coord_to_input(coords)})
@@ -1334,8 +1322,8 @@ class Experiment(ABC):
                 delta_level = float(
                     'inf') if dynamics.set_mode in ['reach','reach_avoid'] else float('-inf')
 
-                results = scenario_optimization(device=device,
-                    model=model, policy=model,dynamics=dynamics,
+                results = scenario_optimization(
+                    model=model, dynamics=dynamics,
                     tMin=dataset.tMin, tMax=dataset.tMax, dt=dt,
                     set_type=set_type, control_type=control_type,
                     scenario_batch_size=min(N, 100000), sample_batch_size=10*min(N, 10000),
@@ -1425,8 +1413,8 @@ class Experiment(ABC):
                 algorithm_iters = []
                 for i in range(M):
                     print('algorithm iter', str(i))
-                    results = scenario_optimization(device=device,
-                        model=model, policy=model,dynamics=dynamics,
+                    results = scenario_optimization(
+                        model=model, dynamics=dynamics,
                         tMin=dataset.tMin, tMax=dataset.tMax, dt=dt,
                         set_type=set_type, control_type=control_type,
                         scenario_batch_size=min(N, 100000), sample_batch_size=10*min(N, 10000),
@@ -1481,7 +1469,7 @@ class Experiment(ABC):
                 # 2. record solution volume, recovered volume
                 S = 1000000
                 logs['S'] = S
-                logs['learned_volume'] = target_fraction(device=device,
+                logs['learned_volume'] = target_fraction(
                     model=model, dynamics=dynamics, t=dataset.tMax,
                     sample_validator=ValueThresholdValidator(
                         v_min=float('-inf'), v_max=float('inf')),
@@ -1490,7 +1478,7 @@ class Experiment(ABC):
                     num_samples=S,
                     batch_size=min(S, 1000000),
                 ).item()
-                logs['recovered_volume'] = target_fraction(device=device,
+                logs['recovered_volume'] = target_fraction(
                     model=model, dynamics=dynamics, t=dataset.tMax,
                     sample_validator=ValueThresholdValidator(
                         v_min=float('-inf'), v_max=float('inf')),
@@ -1500,8 +1488,8 @@ class Experiment(ABC):
                     batch_size=min(S, 1000000)
                 ).item()
 
-                results = scenario_optimization(device=device,
-                    model=model, policy=model,dynamics=dynamics,
+                results = scenario_optimization(
+                    model=model, dynamics=dynamics,
                     tMin=dataset.tMin, tMax=dataset.tMax, dt=dt,
                     set_type=set_type, control_type=control_type,
                     scenario_batch_size=min(S, 100000), sample_batch_size=10*min(S, 10000),
@@ -1524,8 +1512,8 @@ class Experiment(ABC):
                     logs['theoretically_recoverable_volume']))
 
                 # 3. validate theoretical guarantees via mass sampling
-                results = scenario_optimization(device=device,
-                    model=model, policy=model,dynamics=dynamics,
+                results = scenario_optimization(
+                    model=model, dynamics=dynamics,
                     tMin=dataset.tMin, tMax=dataset.tMax, dt=dt,
                     set_type=set_type, control_type=control_type,
                     scenario_batch_size=min(S, 100000), sample_batch_size=10*min(S, 10000),
@@ -1547,45 +1535,6 @@ class Experiment(ABC):
                     pickle.dump(logs, f)
 
             if data_step == 'plot_basic_recovery':
-                with open(os.path.join(self.experiment_dir, 'basic_logs.pickle'), 'rb') as f:
-                    logs = pickle.load(f)
-
-                # 0.
-                print('N:', str(logs['N']))
-                print('M:', str(logs['M']))
-                print('beta:', str(logs['beta']))
-                print('epsilon:', str(logs['epsilon']))
-                print('S:', str(logs['S']))
-                print('delta level', str(logs['delta_level']))
-                delta_level = logs['delta_level']
-                print('learned volume', str(logs['learned_volume']))
-                print('recovered volume', str(logs['recovered_volume']))
-                print('theoretically recoverable volume', str(
-                    logs['theoretically_recoverable_volume']))
-                print('recovered violation rate', str(
-                    logs['recovered_violation_rate']))
-
-                # fig, _ = self.plot_recovery_fig(
-                #     dataset, dynamics, model, delta_level)
-                plot_config = self.dataset.dynamics.plot_config()
-
-                state_test_range = self.dataset.dynamics.state_test_range()
-                
-                times = [self.dataset.tMax]
-                if plot_config['z_axis_idx'] == -1:
-                    fig = self.plotSingleFig(
-                        state_test_range, plot_config, 512, 512, times, delta_level)
-                else:
-                    fig= self.plotMultipleFigs(
-                        state_test_range, plot_config, 512, 512, 5, times, delta_level)
-                # plt.tight_layout()
-                fig.savefig(os.path.join(
-                    testing_dir, f'basic_BRTs.png'), dpi=800)
-                np.save(os.path.join(
-                    testing_dir, f'volumes.npy'), np.array([float(logs['learned_volume']),
-                                                            float(logs['recovered_volume']),float(logs['theoretically_recoverable_volume'])]))
-
-            if data_step == 'plot_ND':
                 with open(os.path.join(self.experiment_dir, 'basic_logs.pickle'), 'rb') as f:
                     logs = pickle.load(f)
 
