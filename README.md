@@ -1,6 +1,10 @@
 # DeepReach_with_neural_ADP: 
 * 'this research is inherited from deepreach (somil bansal, stanford)'
-
+### [Paper](https://www.dbpia.co.kr/journal/articleDetail?nodeId=NODE12757872)<br>
+Authors 
+[Jaeyoung Lee],
+Claire Tomlin<br>
+Seoul National University
 ## High-Level Structure
 The code is organized as follows:
 * `dynamics/dynamics.py` defines the dynamics of the system.
