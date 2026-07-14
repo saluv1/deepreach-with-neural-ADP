@@ -64,26 +64,6 @@ Systems are defined in `dynamics/dynamics.py` and inherit from the abstract `Dyn
 * `hamiltonian(self, state, dvds)`, which implements the system's hamiltonian
 * `plot_config(self)`, which specifies the state slices and axes visualized in training plots
 
-## Citation
-If you find our work useful in your research, please cite:
-```
-@software{deepreach2024,
-  author = {Lin, Albert and Feng, Zeyuan and Borquez, Javier and Bansal, Somil},
-  title = {{DeepReach Repository}},
-  url = {https://github.com/smlbansal/deepreach},
-  year = {2024}
-}
-```
-
-```
-@inproceedings{bansal2020deepreach,
-    author = {Bansal, Somil
-              and Tomlin, Claire},
-    title = {{DeepReach}: A Deep Learning Approach to High-Dimensional Reachability},
-    booktitle = {IEEE International Conference on Robotics and Automation (ICRA)},
-    year={2021}
-}
-```
 
 ## Contact
 If you have any questions, please feel free to email the authors.
