@@ -1,24 +1,5 @@
-# DeepReach: A Deep Learning Approach to High-Dimensional Reachability
-### [Project Page](http://people.eecs.berkeley.edu/~somil/index.html) | [Paper](https://arxiv.org/pdf/2011.02082.pdf)<br>
-
-Repository Maintainers<br>
-[Albert Lin](https://www.linkedin.com/in/albertkuilin/),
-[Zeyuan Feng](https://thezeyuanfeng.github.io/),
-[Javier Borquez](https://javierborquez.github.io/),
-[Somil Bansal](http://people.eecs.berkeley.edu/~somil/index.html)<br>
-University of Southern California
-
-Original Authors<br>
-[Somil Bansal](http://people.eecs.berkeley.edu/~somil/index.html),
-Claire Tomlin<br>
-University of California, Berkeley
-
-(Still to come...) The Safe and Intelligent Autonomy (SIA) Lab at the University of Southern California
-is still working on an easy-to-use DeepReach Python package which will follow much of the same organizational principles as
-the [hj_reachability package in JAX](https://github.com/StanfordASL/hj_reachability) from the Autonomous Systems Lab at Stanford.
-The future version will include the newest tips and tricks of DeepReach developed by SIA.
-
-(In the meantime...) This branch provides a moderately refactored version of DeepReach to facilitate easier outside research on DeepReach.
+# DeepReach_with_neural_ADP: 
+* 'this research is inherited from deepreach (somil bansal, stanford)
 
 ## High-Level Structure
 The code is organized as follows:
@@ -28,10 +9,8 @@ The code is organized as follows:
 * `utils/dataio.py` loads training and testing data.
 * `utils/diff_operators.py` contains implementations of differential operators.
 * `utils/losses.py` contains loss functions for the different reachability cases.
-* `run_experiment.py` starts a standard DeepReach experiment run.
+* `run_experiment.py` starts a DeepReach_with_neural_adp experiment run.
 
-## External Tutorial
-Follow along these [tutorial slides](https://docs.google.com/presentation/d/19zxhvZAHgVYDCRpCej2svCw21iRvcxQ0/edit?usp=drive_link&ouid=113852163991034806329&rtpof=true&sd=true) to get started, or continue reading below.
 
 ## Environment Setup
 Create and activate a virtual python environment (env) to manage dependencies:
