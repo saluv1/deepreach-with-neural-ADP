@@ -1,5 +1,5 @@
 # DeepReach_with_neural_ADP: 
-* 'this research is inherited from deepreach (somil bansal, stanford)
+* 'this research is inherited from deepreach (somil bansal, stanford)'
 
 ## High-Level Structure
 The code is organized as follows:
