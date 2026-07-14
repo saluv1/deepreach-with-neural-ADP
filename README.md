@@ -2,8 +2,8 @@
 * 'this research is inherited from deepreach (somil bansal, stanford)'
 ### [Paper](https://www.dbpia.co.kr/journal/articleDetail?nodeId=NODE12757872)<br>
 Authors 
-[Jaeyoung Lee],
-Claire Tomlin<br>
+Jaeyoung Lee,
+[Namhoon_cho](https://aail.snu.ac.kr/)<br>
 Seoul National University
 ## High-Level Structure
 The code is organized as follows:
